@@ -31,6 +31,13 @@ from datetime import datetime, timezone
 # was handled). `ConnectionError` covers ConnectionResetError et al.
 TRANSIENT_NETWORK_ERRORS = (socket.timeout, ConnectionError, urllib.error.URLError)
 
+# WpcomApiError.error codes where the origin site may have actually
+# applied a mutating call even though we got no usable confirmation back
+# — WordPress.com's Jetpack relay can time out on the *response* after
+# the origin has already made the change (see taxonomist#43). Worth a
+# read-back before concluding the call really failed.
+TIMEOUT_SHAPED_ERRORS = {'remote_request_timeout', 'connection_error'}
+
 
 def wp_urlencode(params):
     """
@@ -559,7 +566,11 @@ class WpcomAdapter:
             WpcomApiError: If any category ID is not found in the
                 local cache, or if the API silently drops one of the
                 submitted IDs (a known `categories_by_id` silent
-                failure mode — see PR #10).
+                failure mode — see PR #10). If the POST itself times out
+                or the confirmation is otherwise lost (see taxonomist#43),
+                a read-back is attempted before raising — if the live
+                post already matches `category_ids`, the call succeeds
+                normally instead of raising a false failure.
             ValueError: If category_ids is empty and allow_clear is False,
                 or if logging is enabled but old_category_ids is not
                 supplied (would produce an unrevertable log row).
@@ -617,29 +628,45 @@ class WpcomAdapter:
             f'https://public-api.wordpress.com/rest/v1.2'
             f'/sites/{self.site_id}/posts/{post_id}'
         )
-        result = self._request(
-            'POST',
-            path='',
-            override_url=v1_2_url,
-            json_body={'categories_by_id': category_ids},
-        )
-
-        # Detect silent drops: compare returned category IDs against
-        # what we sent. PR #10 documents that `categories_by_id`
-        # silently drops unknown or stale IDs with no error, so the
-        # only reliable check is a read-back of the response.
-        returned_ids = set()
-        terms_cat = (result.get('terms') or {}).get('category') or {}
-        for cat in terms_cat.values():
-            if isinstance(cat, dict) and 'ID' in cat:
-                returned_ids.add(int(cat['ID']))
-        # Fallback: older shape under `categories` (name-keyed hash).
-        if not returned_ids:
-            for cat in (result.get('categories') or {}).values():
+        sent_ids = set(category_ids)
+        timeout_error = None
+        try:
+            result = self._request(
+                'POST',
+                path='',
+                override_url=v1_2_url,
+                json_body={'categories_by_id': category_ids},
+            )
+        except WpcomApiError as e:
+            if e.error not in TIMEOUT_SHAPED_ERRORS:
+                raise
+            # The confirmation was lost, but the origin site may have
+            # already applied the change before the relay timed out (see
+            # taxonomist#43). Read back the post's live categories rather
+            # than assuming failure.
+            timeout_error = e
+            live_ids = self._get_post_category_ids(post_id)
+            if live_ids is None:
+                # Couldn't even read the post back — genuinely can't tell
+                # what happened, so surface the original error.
+                raise
+            returned_ids = live_ids
+        else:
+            # Detect silent drops: compare returned category IDs against
+            # what we sent. PR #10 documents that `categories_by_id`
+            # silently drops unknown or stale IDs with no error, so the
+            # only reliable check is a read-back of the response.
+            returned_ids = set()
+            terms_cat = (result.get('terms') or {}).get('category') or {}
+            for cat in terms_cat.values():
                 if isinstance(cat, dict) and 'ID' in cat:
                     returned_ids.add(int(cat['ID']))
+            # Fallback: older shape under `categories` (name-keyed hash).
+            if not returned_ids:
+                for cat in (result.get('categories') or {}).values():
+                    if isinstance(cat, dict) and 'ID' in cat:
+                        returned_ids.add(int(cat['ID']))
 
-        sent_ids = set(category_ids)
         if sent_ids and returned_ids != sent_ids:
             dropped = sorted(sent_ids - returned_ids)
             extra = sorted(returned_ids - sent_ids)
@@ -649,7 +676,7 @@ class WpcomAdapter:
                 f'{sorted(sent_ids)} but post ended with '
                 f'{sorted(returned_ids)} '
                 f'(dropped={dropped}, extra={extra})',
-            )
+            ) from timeout_error
 
         if self.changes_log_path:
             self._log_post_change(
@@ -663,6 +690,33 @@ class WpcomAdapter:
                 old_category_slugs=old_slugs,
                 new_category_slugs=new_slugs,
             )
+
+    def _get_post_category_ids(self, post_id):
+        """
+        Read a post's current category IDs directly from the API.
+
+        Used by set_post_categories() to check whether a write actually
+        landed when its confirmation response was lost (see
+        taxonomist#43) — a transient-looking failure isn't necessarily a
+        real one on this API.
+
+        Returns:
+            A set of integer category IDs, or None if the post itself
+            couldn't be read back (so the caller can tell "couldn't
+            verify" apart from "verified, and it's different").
+        """
+        try:
+            post = self._get(
+                f'/sites/{self.site_id}/posts/{post_id}',
+                params={'fields': 'ID,categories'},
+            )
+        except WpcomApiError:
+            return None
+        cat_hash = post.get('categories') or {}
+        return {
+            int(cat['ID']) for cat in cat_hash.values()
+            if isinstance(cat, dict) and 'ID' in cat
+        }
 
     def _resolve_id_to_name(self, term_id):
         cat = self._get_category_by_id(term_id)

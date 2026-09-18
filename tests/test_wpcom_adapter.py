@@ -663,6 +663,97 @@ class TestSetPostCategories(unittest.TestCase):
         # the legacy shape.
         adapter.set_post_categories(100, [1])
 
+    def _http_error(self, status, error, message):
+        """Build an HTTPError with a JSON body, as _request() expects."""
+        body = json.dumps({'error': error, 'message': message}).encode()
+        return urllib.error.HTTPError('url', status, error, {}, io.BytesIO(body))
+
+    @patch('adapters.wpcom_adapter.urllib.request.urlopen')
+    def test_reads_back_after_remote_request_timeout(self, mock_urlopen):
+        """A lost confirmation isn't a failure if the write landed anyway.
+
+        Regression for taxonomist#43: WordPress.com's Jetpack relay can
+        time out on the *response* after the origin site already applied
+        the category change. A read-back showing the intended state must
+        make this call succeed, not raise.
+        """
+        cats = [
+            {'ID': 1, 'name': 'Tech', 'slug': 'tech', 'parent': 0},
+            {'ID': 2, 'name': 'AI', 'slug': 'ai', 'parent': 0},
+        ]
+        mock_urlopen.side_effect = [
+            _mock_response({'found': 2, 'categories': cats}),  # cache
+            self._http_error(
+                400, 'remote_request_timeout',
+                'The Jetpack site is inaccessible or returned an error: '
+                'Jetpack: [http_request_failed] cURL error 28: Operation '
+                'timed out after 30002 milliseconds with 0 bytes received',
+            ),
+            # Read-back: the write actually landed.
+            _mock_response({
+                'ID': 100,
+                'categories': {
+                    'Tech': {'ID': 1, 'slug': 'tech'},
+                    'AI': {'ID': 2, 'slug': 'ai'},
+                },
+            }),
+        ]
+        adapter = WpcomAdapter(VALID_CONFIG)
+        # Must not raise.
+        adapter.set_post_categories(100, [1, 2])
+        self.assertEqual(mock_urlopen.call_count, 3)
+
+    @patch('adapters.wpcom_adapter.urllib.request.urlopen')
+    def test_raises_when_readback_shows_write_did_not_land(self, mock_urlopen):
+        """A timeout where the write genuinely failed still raises."""
+        cats = [
+            {'ID': 1, 'name': 'Tech', 'slug': 'tech', 'parent': 0},
+        ]
+        mock_urlopen.side_effect = [
+            _mock_response({'found': 1, 'categories': cats}),  # cache
+            self._http_error(400, 'remote_request_timeout', 'timed out'),
+            # Read-back: the post still has its old categories — the
+            # write never actually landed.
+            _mock_response({'ID': 100, 'categories': {}}),
+        ]
+        adapter = WpcomAdapter(VALID_CONFIG)
+        with self.assertRaises(WpcomApiError) as ctx:
+            adapter.set_post_categories(100, [1])
+        self.assertEqual(ctx.exception.error, 'categories_drift')
+
+    @patch('adapters.wpcom_adapter.urllib.request.urlopen')
+    def test_raises_original_error_when_readback_itself_fails(self, mock_urlopen):
+        """If we can't even read the post back, surface the original error."""
+        cats = [
+            {'ID': 1, 'name': 'Tech', 'slug': 'tech', 'parent': 0},
+        ]
+        mock_urlopen.side_effect = [
+            _mock_response({'found': 1, 'categories': cats}),  # cache
+            self._http_error(400, 'remote_request_timeout', 'timed out'),
+            self._http_error(404, 'unknown_post', 'Post not found'),
+        ]
+        adapter = WpcomAdapter(VALID_CONFIG)
+        with self.assertRaises(WpcomApiError) as ctx:
+            adapter.set_post_categories(100, [1])
+        self.assertEqual(ctx.exception.error, 'remote_request_timeout')
+
+    @patch('adapters.wpcom_adapter.urllib.request.urlopen')
+    def test_non_timeout_error_is_never_read_back(self, mock_urlopen):
+        """A real, non-transient error (e.g. auth) must not trigger a read-back."""
+        cats = [
+            {'ID': 1, 'name': 'Tech', 'slug': 'tech', 'parent': 0},
+        ]
+        mock_urlopen.side_effect = [
+            _mock_response({'found': 1, 'categories': cats}),  # cache
+            self._http_error(403, 'unauthorized', 'bad token'),
+        ]
+        adapter = WpcomAdapter(VALID_CONFIG)
+        with self.assertRaises(WpcomApiError) as ctx:
+            adapter.set_post_categories(100, [1])
+        self.assertEqual(ctx.exception.error, 'unauthorized')
+        # Only the cache GET + the failing POST — no read-back GET.
+        self.assertEqual(mock_urlopen.call_count, 2)
+
 
 class TestExportPosts(unittest.TestCase):
     """Tests for post export with category normalization."""
