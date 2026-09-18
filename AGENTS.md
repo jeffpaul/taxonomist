@@ -42,7 +42,7 @@ This is an AI-assisted tool. Users download this repo, open it with their AI cod
 ### Core Principles
 
 - **Full content analysis**: Always analyze complete post content with AI agents, never rely on keyword search alone
-- **Nothing is lost**: Every change is logged with enough detail to undo it exactly. Pre-change backups are mandatory.
+- **Nothing is lost**: Every change is logged with enough detail to undo it exactly. Pre-change backups are mandatory, and must be validated with `lib.helpers.validate_backup()` immediately after writing — see the Backup sections of `agents/export.md` and `agents/apply.md`.
 - **Iterative**: The user approves every phase before the next one begins
 - **Dry-run first**: Destructive operations are always previewed before execution
 - **Parallel processing**: Posts are analyzed in batches using parallel agents for speed

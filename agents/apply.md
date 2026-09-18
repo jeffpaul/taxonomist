@@ -25,6 +25,8 @@ the remote endpoint requires it.
 BEFORE making any changes, create:
 - `data/backups/backup-{timestamp}.json` — full pre-apply taxonomy snapshot. For WP-CLI: `wp eval-file lib/backup.php`. For WordPress.com: `WpcomAdapter.backup('data/backups/backup-{timestamp}.json')`.
 
+**This backup is a hard gate, not a nice-to-have — the same standard as the capability check.** Immediately after writing it, validate it with `lib.helpers.validate_backup()` (same call as in `agents/export.md`'s Backup section) and **STOP** if it's invalid. Time has passed since the pre-analysis backup, and the site may have changed — don't assume this one is fine just because the earlier one was. Never begin applying changes against an unverified backup.
+
 Two TSV logs are written during the apply run. They live next to the backup and the restore agent reads them to do a precise inverse replay:
 
 - `data/logs/changes-{timestamp}.tsv` — per-post category changes. Schema:
