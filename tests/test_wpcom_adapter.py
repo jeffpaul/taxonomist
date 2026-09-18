@@ -13,11 +13,12 @@ import io
 import json
 import os
 import shutil
+import socket
 import sys
 import tempfile
 import unittest
 import urllib.error
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'lib'))
 from adapters.wpcom_adapter import (
@@ -816,12 +817,16 @@ class TestErrorHandling(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 500)
         error.close()
 
+    @patch('adapters.wpcom_adapter.time.sleep')
     @patch('adapters.wpcom_adapter.urllib.request.urlopen')
-    def test_connection_error_raised(self, mock_urlopen):
+    def test_connection_error_raised(self, mock_urlopen, mock_sleep):
+        """A persistent connection error is retried, then raised."""
         mock_urlopen.side_effect = urllib.error.URLError('Name resolution failed')
         adapter = WpcomAdapter(VALID_CONFIG)
         with self.assertRaises(WpcomApiError) as ctx:
             adapter.list_categories()
+        # Retried max_retries times (default 3), not just attempted once.
+        self.assertEqual(mock_urlopen.call_count, adapter.max_retries)
         self.assertEqual(ctx.exception.status_code, 0)
         self.assertIn('connection_error', ctx.exception.error)
 
@@ -845,6 +850,96 @@ class TestErrorHandling(unittest.TestCase):
         with self.assertRaises(WpcomApiError) as ctx:
             adapter.list_categories()
         self.assertIn('unauthorized', str(ctx.exception))
+
+
+class TestRequestRetry(unittest.TestCase):
+    """
+    Tests for _request()'s retry/backoff on transient network errors.
+
+    Covers the gap described in taxonomist#48: previously a single
+    connection blip (timeout, reset, DNS hiccup) aborted the call
+    immediately with no retry, and a bare socket.timeout raised during
+    the read phase wasn't even caught — it propagated out of _request()
+    uncaught instead of becoming a WpcomApiError.
+    """
+
+    @patch('adapters.wpcom_adapter.time.sleep')
+    @patch('adapters.wpcom_adapter.urllib.request.urlopen')
+    def test_retries_on_socket_timeout_then_succeeds(self, mock_urlopen, mock_sleep):
+        """A transient socket.timeout is retried, not raised immediately."""
+        mock_urlopen.side_effect = [
+            socket.timeout('The read operation timed out'),
+            _mock_response({'found': 0, 'categories': []}),
+        ]
+        adapter = WpcomAdapter(VALID_CONFIG)
+        result = adapter.list_categories()
+        self.assertEqual(result, [])
+        self.assertEqual(mock_urlopen.call_count, 2)
+        mock_sleep.assert_called_once()
+
+    @patch('adapters.wpcom_adapter.time.sleep')
+    @patch('adapters.wpcom_adapter.urllib.request.urlopen')
+    def test_retries_on_connection_reset_then_succeeds(self, mock_urlopen, mock_sleep):
+        """A transient ConnectionResetError is retried, not raised immediately."""
+        mock_urlopen.side_effect = [
+            ConnectionResetError('Connection reset by peer'),
+            _mock_response({'found': 0, 'categories': []}),
+        ]
+        adapter = WpcomAdapter(VALID_CONFIG)
+        result = adapter.list_categories()
+        self.assertEqual(result, [])
+        self.assertEqual(mock_urlopen.call_count, 2)
+
+    @patch('adapters.wpcom_adapter.time.sleep')
+    @patch('adapters.wpcom_adapter.urllib.request.urlopen')
+    def test_gives_up_after_max_retries(self, mock_urlopen, mock_sleep):
+        """A persistent transient error is eventually raised as WpcomApiError."""
+        mock_urlopen.side_effect = socket.timeout('The read operation timed out')
+        adapter = WpcomAdapter(VALID_CONFIG)
+        adapter.max_retries = 2
+        with self.assertRaises(WpcomApiError) as ctx:
+            adapter.list_categories()
+        self.assertEqual(mock_urlopen.call_count, 2)
+        self.assertEqual(ctx.exception.error, 'connection_error')
+        # One sleep between the 2 attempts, none after the last one.
+        self.assertEqual(mock_sleep.call_count, 1)
+
+    @patch('adapters.wpcom_adapter.time.sleep')
+    @patch('adapters.wpcom_adapter.urllib.request.urlopen')
+    def test_backoff_is_exponential(self, mock_urlopen, mock_sleep):
+        """Backoff doubles each attempt, scaled by retry_backoff_seconds."""
+        mock_urlopen.side_effect = socket.timeout('timed out')
+        adapter = WpcomAdapter(VALID_CONFIG)
+        adapter.max_retries = 3
+        adapter.retry_backoff_seconds = 1
+        with self.assertRaises(WpcomApiError):
+            adapter.list_categories()
+        mock_sleep.assert_has_calls([call(1), call(2)])
+
+    @patch('adapters.wpcom_adapter.time.sleep')
+    @patch('adapters.wpcom_adapter.urllib.request.urlopen')
+    def test_real_api_error_is_never_retried(self, mock_urlopen, mock_sleep):
+        """An HTTPError (a real response) fails fast — no retry, no sleep."""
+        fp = io.BytesIO(b'{"error":"unauthorized","message":"bad token"}')
+        error = urllib.error.HTTPError('url', 401, 'Unauthorized', {}, fp)
+        mock_urlopen.side_effect = error
+        adapter = WpcomAdapter(VALID_CONFIG)
+        with self.assertRaises(WpcomApiError) as ctx:
+            adapter.list_categories()
+        self.assertEqual(mock_urlopen.call_count, 1)
+        mock_sleep.assert_not_called()
+        self.assertEqual(ctx.exception.status_code, 401)
+        error.close()
+
+    @patch('adapters.wpcom_adapter.urllib.request.urlopen')
+    def test_max_retries_configurable_via_connection(self, mock_urlopen):
+        """connection.max_retries / retry_backoff_seconds override the defaults."""
+        config = json.loads(json.dumps(VALID_CONFIG))
+        config['connection']['max_retries'] = 5
+        config['connection']['retry_backoff_seconds'] = 0.5
+        adapter = WpcomAdapter(config)
+        self.assertEqual(adapter.max_retries, 5)
+        self.assertEqual(adapter.retry_backoff_seconds, 0.5)
 
 
 class TestGetDefaultCategory(unittest.TestCase):

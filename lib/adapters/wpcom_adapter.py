@@ -16,12 +16,20 @@ import csv
 import json
 import os
 import re
+import socket
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from contextlib import contextmanager
 from datetime import datetime, timezone
+
+# Exceptions that indicate a transient network problem rather than a real
+# API response — safe to retry. `socket.timeout` covers both the
+# connect-phase and read-phase timeout cases (the latter previously
+# propagated out of _request() uncaught, since only urllib.error.URLError
+# was handled). `ConnectionError` covers ConnectionResetError et al.
+TRANSIENT_NETWORK_ERRORS = (socket.timeout, ConnectionError, urllib.error.URLError)
 
 
 def wp_urlencode(params):
@@ -138,6 +146,15 @@ class WpcomAdapter:
         # Track which log paths have already had a header row written this
         # process so _append_tsv doesn't stat() the file on every row.
         self._log_headers_written = set()
+        # Retry/backoff for transient network errors (timeouts, connection
+        # resets) in _request(). Real API errors (HTTPError with a real
+        # response body, or a 200 with an "error" field) are never
+        # retried — only TRANSIENT_NETWORK_ERRORS are. Configurable via
+        # connection.max_retries / connection.retry_backoff_seconds so a
+        # caller can tune or disable (max_retries=1) for a flakier or
+        # more reliable network than the defaults assume.
+        self.max_retries = int(conn.get('max_retries', 3))
+        self.retry_backoff_seconds = float(conn.get('retry_backoff_seconds', 1))
 
     # --- HTTP layer ---
 
@@ -163,6 +180,12 @@ class WpcomAdapter:
         Raises:
             WpcomApiError: On any API error (including 200 with error
                 field), or if a non-GET request is made without a token.
+                A transient network failure (timeout, connection reset,
+                DNS hiccup) is retried up to `self.max_retries` times with
+                exponential backoff before being raised as
+                WpcomApiError(0, 'connection_error', ...); a real response
+                from the server (HTTPError, or a 200 with an "error"
+                field) is never retried.
         """
         url = override_url if override_url else f'{self.BASE_URL}{path}'
         if params:
@@ -187,40 +210,57 @@ class WpcomAdapter:
         if body:
             req.add_header('Content-Type', content_type)
 
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                resp_body = resp.read().decode('utf-8')
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    resp_body = resp.read().decode('utf-8')
+                    try:
+                        result = json.loads(resp_body)
+                    except json.JSONDecodeError:
+                        raise WpcomApiError(
+                            resp.status, 'invalid_json',
+                            f'Expected JSON, got: {resp_body[:200]}',
+                        )
+                    if isinstance(result, dict) and 'error' in result:
+                        raise WpcomApiError(
+                            resp.status, result['error'],
+                            result.get('message', ''),
+                        )
+                    return result
+            except urllib.error.HTTPError as e:
+                # A real response from the server — never retried, even
+                # for a 5xx, since we can't tell a transient server hiccup
+                # from a real, repeatable error without more context than
+                # we have here. Callers that know a given error is safe to
+                # retry can do so themselves.
                 try:
-                    result = json.loads(resp_body)
+                    body_text = e.read().decode('utf-8', errors='replace')
+                except Exception:
+                    body_text = str(e)
+                try:
+                    err = json.loads(body_text)
+                    raise WpcomApiError(
+                        e.code, err.get('error', 'unknown'),
+                        err.get('message', body_text),
+                    ) from e
                 except json.JSONDecodeError:
+                    raise WpcomApiError(e.code, 'http_error', body_text) from e
+            except TRANSIENT_NETWORK_ERRORS as e:
+                # Network-level failure with no response at all — the kind
+                # of thing a flaky connection or a momentary DNS/routing
+                # hiccup produces. Safe to retry: nothing was sent to the
+                # server's application layer here (contrast with a POST
+                # that reached the server and failed there, which is an
+                # HTTPError above and never retried).
+                if attempt >= self.max_retries:
                     raise WpcomApiError(
-                        resp.status, 'invalid_json',
-                        f'Expected JSON, got: {resp_body[:200]}',
-                    )
-                if isinstance(result, dict) and 'error' in result:
-                    raise WpcomApiError(
-                        resp.status, result['error'],
-                        result.get('message', ''),
-                    )
-                return result
-        except urllib.error.HTTPError as e:
-            try:
-                body_text = e.read().decode('utf-8', errors='replace')
-            except Exception:
-                body_text = str(e)
-            try:
-                err = json.loads(body_text)
-                raise WpcomApiError(
-                    e.code, err.get('error', 'unknown'),
-                    err.get('message', body_text),
-                ) from e
-            except json.JSONDecodeError:
-                raise WpcomApiError(e.code, 'http_error', body_text) from e
-        except urllib.error.URLError as e:
-            raise WpcomApiError(
-                0, 'connection_error',
-                f'Failed to connect to {url}: {e.reason}',
-            ) from e
+                        0, 'connection_error',
+                        f'Failed to connect to {url} after {attempt} '
+                        f'attempt(s): {e}',
+                    ) from e
+                time.sleep(self.retry_backoff_seconds * (2 ** (attempt - 1)))
 
     def _get(self, path, params=None):
         return self._request('GET', path, params=params)
