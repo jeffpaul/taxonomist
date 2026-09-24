@@ -166,7 +166,7 @@ class WpcomAdapter:
     # --- HTTP layer ---
 
     def _request(self, method, path, data=None, params=None,
-                 override_url=None, json_body=None):
+                 override_url=None, json_body=None, idempotent=None):
         """
         Make a request to the WordPress.com API.
 
@@ -180,6 +180,13 @@ class WpcomAdapter:
                 When set, `path` is ignored.
             json_body: If set, send this dict as a JSON body instead of
                 form-urlencoded `data`. Mutually exclusive with `data`.
+            idempotent: Whether repeating this request ends in the same
+                state, and so is safe to retry after a transient network
+                error. Defaults to True for GET and False otherwise: a
+                write whose connection dropped may already have been
+                applied, and repeating e.g. a create turns a lost
+                confirmation into a `term_exists` error. Callers whose
+                write is safe to repeat pass True.
 
         Returns:
             Parsed JSON response as a dict.
@@ -188,12 +195,15 @@ class WpcomAdapter:
             WpcomApiError: On any API error (including 200 with error
                 field), or if a non-GET request is made without a token.
                 A transient network failure (timeout, connection reset,
-                DNS hiccup) is retried up to `self.max_retries` times with
-                exponential backoff before being raised as
-                WpcomApiError(0, 'connection_error', ...); a real response
-                from the server (HTTPError, or a 200 with an "error"
-                field) is never retried.
+                DNS hiccup) on an idempotent request is retried up to
+                `self.max_retries` times with exponential backoff before
+                being raised as WpcomApiError(0, 'connection_error', ...);
+                on a non-idempotent one it's raised on the first failure.
+                A real response from the server (HTTPError, or a 200 with
+                an "error" field) is never retried.
         """
+        if idempotent is None:
+            idempotent = method == 'GET'
         url = override_url if override_url else f'{self.BASE_URL}{path}'
         if params:
             url += '?' + wp_urlencode(params)
@@ -257,11 +267,11 @@ class WpcomAdapter:
             except TRANSIENT_NETWORK_ERRORS as e:
                 # Network-level failure with no response at all — the kind
                 # of thing a flaky connection or a momentary DNS/routing
-                # hiccup produces. Safe to retry: nothing was sent to the
-                # server's application layer here (contrast with a POST
-                # that reached the server and failed there, which is an
-                # HTTPError above and never retried).
-                if attempt >= self.max_retries:
+                # hiccup produces. The request may still have reached the
+                # server and been applied (e.g. a read timeout), so only
+                # idempotent requests are retried; for anything else the
+                # caller gets a connection_error it can read back from.
+                if not idempotent or attempt >= self.max_retries:
                     raise WpcomApiError(
                         0, 'connection_error',
                         f'Failed to connect to {url} after {attempt} '
@@ -281,8 +291,8 @@ class WpcomAdapter:
                 'Run the OAuth flow first.',
             )
 
-    def _post(self, path, data=None):
-        return self._request('POST', path, data=data)
+    def _post(self, path, data=None, idempotent=False):
+        return self._request('POST', path, data=data, idempotent=idempotent)
 
     # --- Category cache ---
 
@@ -356,10 +366,20 @@ class WpcomAdapter:
             return f'verification: category "{slug}" still exists after delete'
         return None
 
-    def _lookup_category_by_name(self, name):
+    def _lookup_category_by_name(self, name, parent=None):
         if not name:
             return None
-        return self._find_category(lambda c: c.get('name') == name)
+
+        def matches(c):
+            if c.get('name') != name:
+                return False
+            if parent is None:
+                return True
+            try:
+                return int(c.get('parent') or 0) == int(parent or 0)
+            except (TypeError, ValueError):
+                return False
+        return self._find_category(matches)
 
     def _has_duplicate_slugs(self, slug):
         """Check if more than one category shares this slug."""
@@ -420,10 +440,13 @@ class WpcomAdapter:
                 ) from e
             except json.JSONDecodeError:
                 raise WpcomApiError(e.code, 'http_error', body_text) from e
-        except urllib.error.URLError as e:
+        except TRANSIENT_NETWORK_ERRORS as e:
+            # Not retried: this endpoint is only used for writes, which
+            # may have been applied before the connection dropped. The
+            # caller gets a connection_error it can read back from.
             raise WpcomApiError(
                 0, 'connection_error',
-                f'Failed to connect to {url}: {e.reason}',
+                f'Failed to connect to {url}: {getattr(e, "reason", e)}',
             ) from e
 
     def _update_category_v2(self, term_id, fields):
@@ -636,6 +659,9 @@ class WpcomAdapter:
                 path='',
                 override_url=v1_2_url,
                 json_body={'categories_by_id': category_ids},
+                # Setting the same category list twice ends in the same
+                # state, so a retry after a dropped connection is safe.
+                idempotent=True,
             )
         except WpcomApiError as e:
             if e.error not in TIMEOUT_SHAPED_ERRORS:
@@ -759,7 +785,27 @@ class WpcomAdapter:
         if parent:
             data['parent'] = parent
 
-        result = self._post(f'/sites/{self.site_id}/categories/new', data=data)
+        # Note what already exists, so a read-back after a lost
+        # confirmation can't mistake a pre-existing category for ours.
+        self._require_auth()
+        known_ids = {c.get('ID') for c in self._ensure_category_cache()}
+        try:
+            result = self._post(
+                f'/sites/{self.site_id}/categories/new', data=data,
+            )
+        except WpcomApiError as e:
+            if e.error not in TIMEOUT_SHAPED_ERRORS:
+                raise
+            # The origin may have created it before the confirmation was
+            # lost (see taxonomist#43). WP.com rejects duplicate names at
+            # the same level, so name + parent identifies it.
+            self._invalidate_category_cache()
+            try:
+                result = self._lookup_category_by_name(name, parent=parent)
+            except WpcomApiError:
+                raise e
+            if result is None or result.get('ID') in known_ids:
+                raise
         self._invalidate_category_cache()
         self._log_term_op(
             ACTION_CREATE_CAT,
@@ -803,13 +849,27 @@ class WpcomAdapter:
         # rehydrate the category exactly.
         snapshot = json.dumps(_term_snapshot(cat), ensure_ascii=False)
 
-        if self._has_duplicate_slugs(cat['slug']):
-            self._delete_category_v2(term_id)
-        else:
-            slug = urllib.parse.quote(cat['slug'], safe='')
-            self._post(
-                f'/sites/{self.site_id}/categories/slug:{slug}/delete',
-            )
+        try:
+            if self._has_duplicate_slugs(cat['slug']):
+                self._delete_category_v2(term_id)
+            else:
+                slug = urllib.parse.quote(cat['slug'], safe='')
+                self._post(
+                    f'/sites/{self.site_id}/categories/slug:{slug}/delete',
+                )
+        except WpcomApiError as e:
+            if e.error not in TIMEOUT_SHAPED_ERRORS:
+                raise
+            # The delete may have landed before the confirmation was lost
+            # (see taxonomist#43). Check by ID rather than slug: with
+            # duplicate slugs, another category can still hold this one.
+            self._invalidate_category_cache()
+            try:
+                still_there = self._get_category_by_id(term_id) is not None
+            except WpcomApiError:
+                raise e
+            if still_there:
+                raise
         self._invalidate_category_cache()
         self._log_term_op(
             ACTION_DELETE_CAT,
@@ -884,7 +944,12 @@ class WpcomAdapter:
         # carries an empty string faithfully, so the form-urlencoded
         # workaround doesn't apply.
         if self._has_duplicate_slugs(current['slug']):
-            result = self._update_category_v2(term_id, payload)
+            try:
+                result = self._update_category_v2(term_id, payload)
+            except WpcomApiError as e:
+                if e.error not in TIMEOUT_SHAPED_ERRORS:
+                    raise
+                result = self._read_back_category_update(term_id, fields, e)
             self._invalidate_category_cache()
             return result
 
@@ -906,10 +971,15 @@ class WpcomAdapter:
         pre_count = self._get_category_count()
 
         slug = urllib.parse.quote(current['slug'], safe='')
-        result = self._post(
-            f'/sites/{self.site_id}/categories/slug:{slug}',
-            data=payload,
-        )
+        try:
+            result = self._post(
+                f'/sites/{self.site_id}/categories/slug:{slug}',
+                data=payload,
+            )
+        except WpcomApiError as e:
+            if e.error not in TIMEOUT_SHAPED_ERRORS:
+                raise
+            result = self._read_back_category_update(term_id, fields, e)
 
         post_count = self._get_category_count()
         if post_count > pre_count:
@@ -955,6 +1025,29 @@ class WpcomAdapter:
             )
 
         return result
+
+    def _read_back_category_update(self, term_id, fields, error):
+        """
+        Check whether an update_category() write landed after its
+        confirmation was lost (see taxonomist#43).
+
+        Returns the live category dict if every field in `fields` already
+        has its intended value, so the caller can carry on as if the POST
+        had returned it. Otherwise re-raises `error`: a lost confirmation
+        with no sign the write landed is still a failure.
+        """
+        self._invalidate_category_cache()
+        try:
+            live = self._get_category_by_id(term_id)
+        except WpcomApiError:
+            raise error
+        if live is None:
+            raise error
+        for key, intended in fields.items():
+            actual = live.get(key)
+            if str('' if actual is None else actual) != str(intended):
+                raise error
+        return live
 
     def get_default_category(self):
         """
@@ -1021,9 +1114,12 @@ class WpcomAdapter:
             else:
                 raise
 
+        # Setting the same default twice ends in the same state, so a
+        # retry after a dropped connection is safe.
         self._post(
             f'/sites/{self.site_id}/settings',
             data={'default_category': term_id},
+            idempotent=True,
         )
         self._log_term_op(
             ACTION_SET_DEFAULT,
