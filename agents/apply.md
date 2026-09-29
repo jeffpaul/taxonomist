@@ -186,11 +186,17 @@ names drift when a category is renamed upstream of the call.
   unlike `set_post_categories`'s full replace, a blind retry there could
   create a duplicate category.
 - **Transient network errors (timeouts, connection resets) are retried
-  automatically** by `WpcomAdapter._request()` — 3 attempts with
-  exponential backoff by default, configurable via
-  `connection.max_retries` / `connection.retry_backoff_seconds` in
-  `config.json`. A real API error (an actual HTTP error response, or a
-  200 with an `error` field) is never retried.
+  automatically, but only where a repeat is safe.**
+  `WpcomAdapter._request()` retries idempotent requests — every GET, plus
+  `set_post_categories()` and `set_default_category()`, which end in the
+  same state when run twice — 3 attempts with exponential backoff by
+  default, configurable via `connection.max_retries` /
+  `connection.retry_backoff_seconds` in `config.json`.
+  `create_category`, `delete_category` and `update_category` are never
+  retried, since the origin site may already have applied the write;
+  they read the category back instead and log the usual term-log row if
+  the change landed. A real API error (an actual HTTP error response, or
+  a 200 with an `error` field) is never retried.
 
 **Custom Taxonomies**: To update custom taxonomies via the WordPress.com API, you MUST use the `terms` parameter. If you use Python to build the query, avoid the "stringified list" bug by using the `wp_urlencode` helper:
 
