@@ -2514,6 +2514,64 @@ class TestSetPostTags(unittest.TestCase):
         adapter.set_post_tags(100, [])
 
     @patch('adapters.wpcom_adapter.urllib.request.urlopen')
+    def test_clear_that_leaves_tags_raises(self, mock_urlopen):
+        """A clear is verified too: with no default-tag fallback, the post
+        must end with no tags. Without this, allow_clear=True by default
+        would let a clear that didn't land pass silently."""
+        mock_urlopen.side_effect = [
+            _mock_response({
+                'ID': 100,
+                'terms': {'post_tag': {
+                    'wordpress': {'ID': 1, 'slug': 'wordpress'},
+                }},
+            }),
+        ]
+        adapter = WpcomAdapter(VALID_CONFIG)
+        with self.assertRaises(WpcomApiError) as ctx:
+            adapter.set_post_tags(100, [])
+        self.assertEqual(ctx.exception.error, 'tags_drift')
+
+    @patch('adapters.wpcom_adapter.urllib.request.urlopen')
+    def test_clear_read_back_that_finds_tags_raises(self, mock_urlopen):
+        """Same check on the read-back path after a lost confirmation."""
+        mock_urlopen.side_effect = [
+            socket.timeout('timed out'),
+            _mock_response({
+                'ID': 100,
+                'tags': {'wordpress': {'ID': 1, 'slug': 'wordpress'}},
+            }),
+        ]
+        adapter = WpcomAdapter(VALID_CONFIG)
+        adapter.max_retries = 1
+        with self.assertRaises(WpcomApiError) as ctx:
+            adapter.set_post_tags(100, [])
+        self.assertEqual(ctx.exception.error, 'tags_drift')
+
+    @patch('adapters.wpcom_adapter.urllib.request.urlopen')
+    def test_name_slug_collision_raises(self, mock_urlopen):
+        """tags_by_id resolves by name, so "WordPress" (slug wordpress-2)
+        can land as the older tag "WP" that still holds `wordpress`. The
+        drift check must catch it."""
+        tags = [
+            {'ID': 1, 'name': 'WP', 'slug': 'wordpress'},
+            {'ID': 2, 'name': 'WordPress', 'slug': 'wordpress-2'},
+        ]
+        mock_urlopen.side_effect = [
+            _mock_response({'found': 2, 'tags': tags}),
+            _mock_response({
+                'ID': 100,
+                'terms': {'post_tag': {
+                    'WP': {'ID': 1, 'slug': 'wordpress'},
+                }},
+            }),
+        ]
+        adapter = WpcomAdapter(VALID_CONFIG)
+        with self.assertRaises(WpcomApiError) as ctx:
+            adapter.set_post_tags(100, [2])
+        self.assertEqual(ctx.exception.error, 'tags_drift')
+        self.assertIn('dropped=[2], extra=[1]', str(ctx.exception))
+
+    @patch('adapters.wpcom_adapter.urllib.request.urlopen')
     def test_unknown_id_raises_before_posting(self, mock_urlopen):
         mock_urlopen.return_value = _mock_response({'found': 0, 'tags': []})
         adapter = WpcomAdapter(VALID_CONFIG)

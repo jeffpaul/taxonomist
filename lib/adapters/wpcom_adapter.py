@@ -1309,17 +1309,27 @@ class WpcomAdapter:
     # ASSUMPTION requiring empirical verification before heavy production
     # use (flagged the same way the categories_by_id behavior originally
     # was, before it got the "verified empirically" treatment in
-    # agents/apply.md): set_post_tags() below assumes the v1.2 posts
-    # endpoint accepts a `tags_by_id` parameter with the same true-replace,
-    # no-junk-creation semantics as `categories_by_id`. This is the
-    # overwhelmingly likely shape by direct symmetry with categories (both
-    # taxonomies share the same underlying REST controller on
-    # WordPress.com), and confirmed empirically for reads — a post's
-    # `terms.post_tag` hash on GET is byte-for-byte the same shape as
-    # `terms.category` — but the POST side has not yet been exercised
-    # against a live site. Do that (create one throwaway tag, assign it to
-    # a test post, read back, delete it) before trusting this at scale;
-    # see agents/tags.md.
+    # agents/apply.md). `tags_by_id` is a documented v1.2 posts parameter,
+    # but it does NOT resolve tags the way `categories_by_id` resolves
+    # categories. The endpoint passes category IDs through as IDs, but it
+    # turns each tag ID into the tag's *name* before writing. Core's
+    # term_exists() then looks that name up by slug first, via
+    # sanitize_title(). So if a tag's name sanitizes to a slug that belongs
+    # to a different tag, the post gets the other tag. Example: "WordPress"
+    # has the slug `wordpress-2` because an older tag, since renamed "WP",
+    # still holds `wordpress`; sending the ID for "WordPress" assigns "WP".
+    # Unknown IDs are skipped silently, the same as for categories.
+    # set_post_tags() compares the post's resulting tag IDs against what
+    # it sent and raises `tags_drift` on any mismatch, so this case fails
+    # loudly instead of mislabelling the post. Expect `tags_drift` on
+    # sites with renamed tags.
+    #
+    # Reads are confirmed empirically: a post's `terms.post_tag` hash on
+    # GET has the same shape as `terms.category`. The POST side has not
+    # yet been exercised against a live site. Do that (create one
+    # throwaway tag, assign it to a test post, read back, delete it)
+    # before trusting this at scale; agents/tags.md (taxonomist#58) walks
+    # through it.
     #
     # No restore-automation support yet: unlike categories,
     # restore()/restore_from_logs()/restore_from_snapshot() do not know
@@ -1333,9 +1343,10 @@ class WpcomAdapter:
         Set tags for a post by term IDs.
 
         Uses v1.2 + `tags_by_id`, mirroring set_post_categories()'s use of
-        `categories_by_id` for the same reasons (a name-based parameter
-        risks the same silent failure modes — see PR #10 for the
-        categories investigation this assumes carries over).
+        `categories_by_id` (see PR #10 for the categories investigation).
+        The endpoint resolves tag IDs by name, not ID, so a tag whose name
+        collides with another tag's slug can land as the wrong tag; see
+        the ASSUMPTION note above. The drift check below catches that.
 
         Args:
             post_id: Integer post ID.
@@ -1357,10 +1368,12 @@ class WpcomAdapter:
 
         Raises:
             WpcomApiError: If any tag ID is not found in the local cache,
-                or if the API silently drops one of the submitted IDs. If
-                the POST itself hits a lost-confirmation-shaped error
-                (see taxonomist#43 — the same Jetpack relay timeout
-                applies here), a read-back is attempted before raising.
+                or if the post's resulting tags differ from tag_ids in any
+                way (a dropped ID, a name-to-slug collision, or a clear
+                that left tags behind). If the POST itself hits a
+                lost-confirmation-shaped error (see taxonomist#43 — the
+                same Jetpack relay timeout applies here), a read-back is
+                attempted before raising.
             ValueError: If tag_ids is empty and allow_clear is False, or
                 if logging is enabled but old_tag_ids is not supplied.
         """
@@ -1429,7 +1442,10 @@ class WpcomAdapter:
                     if isinstance(tag, dict) and 'ID' in tag:
                         returned_ids.add(int(tag['ID']))
 
-        if sent_ids and returned_ids != sent_ids:
+        # Unlike set_post_categories(), an empty list is checked too:
+        # there's no default-tag fallback, so after a clear the post
+        # should have no tags at all.
+        if returned_ids != sent_ids:
             dropped = sorted(sent_ids - returned_ids)
             extra = sorted(returned_ids - sent_ids)
             raise WpcomApiError(

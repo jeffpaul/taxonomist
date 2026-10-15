@@ -867,7 +867,8 @@ def resolve_tag_export_row(tags, *, term_id=None, slug=None, name=None):
     export — never a slug derived from the display name.
 
     Args:
-        tags: Parsed JSON list from data/export/tags.json or
+        tags: Parsed JSON list from data/export/tags.json (written by
+            the tag export step in agents/tags.md, taxonomist#58) or
             backup["tags"].
         term_id: Exact exported term ID to match.
         slug: Exact exported slug to match.
@@ -955,8 +956,9 @@ def find_similar_tags(tags):
     for similarity scoring.
 
     Args:
-        tags: List of tag dicts, each with at least 'name' (as exported
-            by data/export/tags.json or backup["tags"]).
+        tags: List of tag dicts, each with at least 'name' (as found in
+            data/export/tags.json, from agents/tags.md in taxonomist#58,
+            or backup["tags"]).
 
     Returns:
         List of groups (each a list of the original tag dicts) for every
