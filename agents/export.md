@@ -159,3 +159,20 @@ Only launch analyze agents for the incomplete batches. Report to the user how ma
 
 Before any analysis, create a backup:
 - `data/backups/pre-analysis-{timestamp}.json` — Complete taxonomy snapshot with categories, post→category mappings, and `default_category_slug`
+
+**The backup is a hard gate, not a nice-to-have.** Immediately after writing it, validate it with `lib.helpers.validate_backup()`:
+
+```python
+import json, sys
+sys.path.insert(0, 'lib')
+from helpers import validate_backup
+
+with open('data/backups/pre-analysis-{timestamp}.json') as f:
+    backup = json.load(f)
+check = validate_backup(backup)
+if not check['valid']:
+    for error in check['errors']:
+        print(error)
+```
+
+If `valid` is `False`, **STOP** — do not proceed to analysis. A backup that fails structural validation (missing categories, missing post mappings, a missing `default_category_slug`) is exactly the backup you'd need for a revert, and you won't find that out until it's too late to just re-run export and try again. Fix whatever produced the malformed backup and regenerate it before continuing.
