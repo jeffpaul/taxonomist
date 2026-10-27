@@ -1182,6 +1182,72 @@ class TestValidateResultIds(unittest.TestCase):
             self.assertEqual(len(check['invalid_ids']), 0)
             self.assertEqual(len(check['missing_ids']), 0)
 
+    def test_result_prefix_reads_tag_results(self):
+        """Tag results are named tag-result-NNN.json. With the default
+        prefix they would never be read and every batch post would be
+        reported missing, so the tag pass passes result_prefix."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_json(tmpdir, 'tag-batches', 'batch-000.json', [
+                {'post_id': 501, 'title': 'A'},
+                {'post_id': 502, 'title': 'B'},
+            ])
+            self._write_json(tmpdir, 'tag-results', 'tag-result-000.json', [
+                {'post_id': 501, 'tags': [12]},
+                {'post_id': 502, 'tags': [34]},
+            ])
+            results_dir = os.path.join(tmpdir, 'tag-results')
+            batch_dir = os.path.join(tmpdir, 'tag-batches')
+
+            default_check = validate_result_ids(results_dir, batch_dir)
+            self.assertFalse(default_check['valid'])
+            self.assertEqual(default_check['missing_ids'], {501, 502})
+
+            check = validate_result_ids(
+                results_dir, batch_dir, result_prefix='tag-result-',
+            )
+            self.assertTrue(check['valid'])
+            self.assertEqual(len(check['missing_ids']), 0)
+
+    def test_result_prefix_flags_tag_index_bug(self):
+        """The index-vs-ID heuristic must run on tag-result files too."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_json(tmpdir, 'tag-batches', 'batch-000.json', [
+                {'post_id': 2632, 'title': 'A'},
+                {'post_id': 2631, 'title': 'B'},
+                {'post_id': 2630, 'title': 'C'},
+            ])
+            self._write_json(tmpdir, 'tag-results', 'tag-result-000.json', [
+                {'post_id': 0, 'tags': [12]},
+                {'post_id': 1, 'tags': [34]},
+                {'post_id': 2, 'tags': [56]},
+            ])
+            check = validate_result_ids(
+                os.path.join(tmpdir, 'tag-results'),
+                os.path.join(tmpdir, 'tag-batches'),
+                result_prefix='tag-result-',
+            )
+            self.assertFalse(check['valid'])
+            self.assertIn('tag-result-000.json', check['suspect_index_files'])
+
+    def test_default_prefix_skips_tag_results(self):
+        """A category check must not read tag-result files sharing a dir."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_json(tmpdir, 'batches', 'batch-000.json', [
+                {'post_id': 100, 'title': 'A'},
+            ])
+            self._write_json(tmpdir, 'results', 'result-000.json', [
+                {'post_id': 100, 'cats': [10]},
+            ])
+            self._write_json(tmpdir, 'results', 'tag-result-000.json', [
+                {'post_id': 999, 'tags': [12]},
+            ])
+            check = validate_result_ids(
+                os.path.join(tmpdir, 'results'),
+                os.path.join(tmpdir, 'batches'),
+            )
+            self.assertTrue(check['valid'])
+            self.assertEqual(len(check['invalid_ids']), 0)
+
 
 class TestValidateCategoryIds(unittest.TestCase):
     """Tests for category term ID validation in suggestions.

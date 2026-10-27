@@ -606,7 +606,7 @@ def validate_backup(backup):
     return {'valid': not errors, 'errors': errors}
 
 
-def validate_result_ids(results_dir, batch_dir):
+def validate_result_ids(results_dir, batch_dir, result_prefix='result-'):
     """
     Verify that every post_id in the analysis results actually exists in the
     source batches.
@@ -619,6 +619,9 @@ def validate_result_ids(results_dir, batch_dir):
     Args:
         results_dir: Directory containing result-NNN.json files.
         batch_dir: Directory containing the corresponding batch-NNN.json files.
+        result_prefix: Filename prefix of the result files. Defaults to
+            'result-' for the category pass; the tag pass writes
+            tag-result-NNN.json files and passes 'tag-result-'.
 
     Returns:
         A dict with keys:
@@ -648,7 +651,7 @@ def validate_result_ids(results_dir, batch_dir):
     result_ids = set()
     per_file = {}  # filename -> list of post_ids
     for filename in sorted(os.listdir(results_dir)):
-        if not (filename.startswith('result-') and filename.endswith('.json')):
+        if not (filename.startswith(result_prefix) and filename.endswith('.json')):
             continue
         with open(os.path.join(results_dir, filename)) as f:
             ids = []
