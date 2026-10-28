@@ -204,3 +204,72 @@ class WpCliAdapter:
     def delete_category(self, term_id):
         """Delete a category."""
         return self._run_command(['term', 'delete', 'category', str(term_id)])
+
+    # --- Tags ---
+    #
+    # Mirrors the category methods above for WordPress core's flat
+    # `post_tag` taxonomy (no parent, no default term). Bulk tag
+    # reassignment with logging goes through lib/apply-changes.php with
+    # TAXONOMIST_TAXONOMY=post_tag, the same way categories use it; these
+    # methods cover listing, one-off assignments, and term create/delete.
+
+    def list_tags(self):
+        """List all tags as JSON.
+
+        Same fields as list_categories() minus `parent`, which tags don't
+        have.
+        """
+        output = self._run_command([
+            'term', 'list', 'post_tag', '--format=json',
+            '--fields=term_id,name,slug,description,count',
+        ])
+        return json.loads(output)
+
+    def set_post_tags(self, post_id, tag_ids, allow_clear=True):
+        """Set a post's complete tag list by term ID.
+
+        Uses the same separate-positional-args + --by=id form as
+        set_post_categories(), for the same reason: anything else lets wp
+        match the value as a slug and create a junk tag. Matching by ID
+        also avoids the name-to-slug collision that makes
+        WpcomAdapter.set_post_tags() raise `tags_drift`.
+
+        An empty tag_ids list removes every tag from the post (`wp post
+        term set` needs at least one term, so this uses `wp post term
+        remove --all`). Tags have no default term, so this is a normal end
+        state; pass allow_clear=False to refuse it instead, matching
+        WpcomAdapter.set_post_tags().
+        """
+        tag_ids = [int(tid) for tid in tag_ids]
+        if not tag_ids:
+            if not allow_clear:
+                raise ValueError(
+                    f'set_post_tags(post_id={post_id}): refusing to set an '
+                    'empty tag list with allow_clear=False.'
+                )
+            return self._run_command(
+                ['post', 'term', 'remove', str(post_id), 'post_tag', '--all']
+            )
+        args = ['post', 'term', 'set', str(post_id), 'post_tag']
+        args.extend(str(tid) for tid in tag_ids)
+        args.append('--by=id')
+        return self._run_command(args)
+
+    def create_tag(self, name, slug, description=''):
+        """Create a new tag."""
+        # Same argument-injection guard as create_category(): name is a
+        # bare positional that wp would parse as a flag if it began with '-'.
+        _reject_option_like(name, 'tag name')
+        _reject_option_like(slug, 'tag slug')
+        args = ['term', 'create', 'post_tag', name, f'--slug={slug}']
+        if description:
+            args.append(f'--description={description}')
+        return self._run_command(args)
+
+    def delete_tag(self, term_id):
+        """Delete a tag by term ID."""
+        if not isinstance(term_id, int):
+            raise TypeError(
+                f'term_id must be int, got {type(term_id).__name__}'
+            )
+        return self._run_command(['term', 'delete', 'post_tag', str(term_id)])

@@ -186,5 +186,91 @@ class TestExportUploadsScript(unittest.TestCase):
         self.assertNotIn('lib/export-posts.php', evalfile_cmds[0])
 
 
+class TestTagMethods(unittest.TestCase):
+    """Tag methods mirror the category ones against `post_tag`, with the
+    same --by=id and argument-injection hardening."""
+
+    @patch('adapters.wp_cli_adapter.subprocess.run')
+    def test_list_tags_queries_post_tag(self, mock_run):
+        mock_run.return_value = _ok_run()
+        mock_run.return_value.stdout = (
+            '[{"term_id": 31, "name": "Gutenberg", "slug": "gutenberg",'
+            ' "description": "", "count": 3}]'
+        )
+        adapter = WpCliAdapter(_local_config())
+        tags = adapter.list_tags()
+        argv = mock_run.call_args[0][0]
+        self.assertEqual(argv[1:4], ['term', 'list', 'post_tag'])
+        self.assertIn('--fields=term_id,name,slug,description,count', argv)
+        self.assertEqual(tags[0]['term_id'], 31)
+
+    @patch('adapters.wp_cli_adapter.subprocess.run')
+    def test_set_post_tags_uses_by_id_and_separate_args(self, mock_run):
+        """Same failure mode as categories: a comma-joined or slug-matched
+        value makes wp create a junk tag named after the ID."""
+        mock_run.return_value = _ok_run()
+        adapter = WpCliAdapter(_local_config())
+        adapter.set_post_tags(123, [31, 57])
+        argv = mock_run.call_args[0][0]
+        self.assertEqual(
+            argv[1:], ['post', 'term', 'set', '123', 'post_tag', '31', '57', '--by=id'],
+        )
+
+    @patch('adapters.wp_cli_adapter.subprocess.run')
+    def test_set_post_tags_empty_list_removes_all(self, mock_run):
+        """`wp post term set` needs at least one term, so clearing a post's
+        tags has to go through `post term remove --all`."""
+        mock_run.return_value = _ok_run()
+        adapter = WpCliAdapter(_local_config())
+        adapter.set_post_tags(123, [])
+        argv = mock_run.call_args[0][0]
+        self.assertEqual(
+            argv[1:], ['post', 'term', 'remove', '123', 'post_tag', '--all'],
+        )
+
+    @patch('adapters.wp_cli_adapter.subprocess.run')
+    def test_set_post_tags_refuses_clear_when_disallowed(self, mock_run):
+        adapter = WpCliAdapter(_local_config())
+        with self.assertRaises(ValueError):
+            adapter.set_post_tags(123, [], allow_clear=False)
+        mock_run.assert_not_called()
+
+    @patch('adapters.wp_cli_adapter.subprocess.run')
+    def test_create_tag_rejects_option_like_name(self, mock_run):
+        adapter = WpCliAdapter(_local_config())
+        with self.assertRaises(ValueError):
+            adapter.create_tag('--require=/tmp/evil.php', 'evil')
+        with self.assertRaises(ValueError):
+            adapter.create_tag('Tech', '--path=/etc')
+        mock_run.assert_not_called()
+
+    @patch('adapters.wp_cli_adapter.subprocess.run')
+    def test_create_tag_targets_post_tag(self, mock_run):
+        mock_run.return_value = _ok_run()
+        adapter = WpCliAdapter(_local_config())
+        adapter.create_tag('Gutenberg', 'gutenberg', 'Block editor')
+        argv = mock_run.call_args[0][0]
+        self.assertEqual(argv[1:5], ['term', 'create', 'post_tag', 'Gutenberg'])
+        self.assertIn('--slug=gutenberg', argv)
+        self.assertIn('--description=Block editor', argv)
+
+    @patch('adapters.wp_cli_adapter.subprocess.run')
+    def test_delete_tag_by_int_id(self, mock_run):
+        mock_run.return_value = _ok_run()
+        adapter = WpCliAdapter(_local_config())
+        adapter.delete_tag(31)
+        argv = mock_run.call_args[0][0]
+        self.assertEqual(argv[1:], ['term', 'delete', 'post_tag', '31'])
+
+    @patch('adapters.wp_cli_adapter.subprocess.run')
+    def test_delete_tag_rejects_non_int(self, mock_run):
+        """A slug or digit-string here would mean the caller guessed the
+        term instead of resolving it from the export."""
+        adapter = WpCliAdapter(_local_config())
+        with self.assertRaises(TypeError):
+            adapter.delete_tag('31')
+        mock_run.assert_not_called()
+
+
 if __name__ == '__main__':
     unittest.main()
