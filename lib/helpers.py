@@ -318,13 +318,13 @@ def aggregate_results(results_dir):
     If the same post_id appears multiple times, the last file in sorted order
     wins so targeted reruns can replace stale earlier results.
 
-    Args:
-        results_dir: Directory containing result-NNN.json files.
-
     "new_cats" entries may be plain name strings or objects with a "name"
     and an optional "parent_slug" (see validate_suggestions()). Both forms
     are counted by name, so "Jazz" and {"name": "Jazz"} are the same
     suggestion.
+
+    Args:
+        results_dir: Directory containing result-NNN.json files.
 
     Returns:
         Dict with 'suggestions' (list of dicts), 'category_counts' (Counter),
