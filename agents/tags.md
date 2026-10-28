@@ -88,9 +88,11 @@ On `wp-cli-ssh` / `wp-cli-local` the same call works. `WpCliAdapter.backup()` up
 
 **Validate it immediately, matching the hard-gate requirement in `agents/export.md`'s Backup section** — `lib.helpers.validate_backup()` doesn't check `tags`/`post_tags` specifically (they're additive fields, not in its required-keys list), but it does verify the backup is well-formed JSON with the base structure intact. Run it and STOP if invalid, same as the category pass.
 
-**Known limitation — read before relying on this for tags specifically:** unlike categories, tag mutations do **not** yet have automated restore support. The backup captures tag state and `set_logging()`'s `tag_changes_log_path`/`tag_terms_log_path` (or, on WP-CLI, `lib/apply-changes.php`'s change log) record every tag change made during apply, but neither `restore()` nor `lib/restore.php` knows how to replay them yet. Tell the user this explicitly before applying anything: a tag-apply run is not currently a "one command to undo" operation the way a category-apply run is — recovery today means manually reading `tags`/`post_tags` back out of the backup JSON and reapplying by hand, or reading the change logs and reversing entries yourself. Get an explicit go-ahead from the user on this basis before applying tag changes, not just before applying category changes.
+On `wpcom-api`, this backup, together with the tag logs written in Step 7, is what makes a tag-apply run revertible with `WpcomAdapter.restore()` (see Revert below), the same as a category-apply run. Keep its `{ts}`: the revert locates the run by it.
 
-**What the backup doesn't cover:** `tags`/`post_tags`, like the export, only read published posts of type `post`. Deleting a tag removes it from everything that has it, including drafts, scheduled and private posts, and custom post types, so those assignments can't be recovered from the backup. Those posts aren't in the plan either, so a merge leaves them with neither the old tag nor the new one. Tell the user this along with the restore limitation above.
+**Known limitation on WP-CLI — read before applying tags on a `wp-cli-*` site:** `lib/restore.php` doesn't replay tag changes yet. The backup captures tag state and `lib/apply-changes.php`'s change log records every post-level tag change, but a WP-CLI tag-apply run is not a "one command to undo" operation the way a category-apply run is. Recovery means manually reading `tags`/`post_tags` back out of the backup JSON and reapplying by hand, or reading the change log and reversing entries yourself. Tell the user this explicitly before applying anything, and get an explicit go-ahead on this basis before applying tag changes, not just before applying category changes.
+
+**What the backup doesn't cover:** `tags`/`post_tags`, like the export, only read published posts of type `post`. Deleting a tag removes it from everything that has it, including drafts, scheduled and private posts, and custom post types, so those assignments can't be recovered from the backup, and an automated revert can't bring them back either. Those posts aren't in the plan either, so a merge leaves them with neither the old tag nor the new one. Tell the user this before applying, along with the WP-CLI restore limitation above when it applies.
 
 ## Step 3 — Find fragmentation candidates
 
@@ -200,7 +202,7 @@ Present one table combining:
 - Any additional synonym merges or retire candidates from Step 4 (AI-assisted — flag confidence level).
 - Any genuinely new tags proposed (should be rare; justify each one).
 
-Use `AskUserQuestion` for the whole-plan approval, same as the category workflow — one approval step, not one question per tag group. Call out the restore limitation from Step 2 again here, right before asking for approval, so it's the last thing the user sees before saying yes.
+Use `AskUserQuestion` for the whole-plan approval, same as the category workflow — one approval step, not one question per tag group. Mention, right before asking for approval, what a revert can and can't do, so it's the last thing the user sees before saying yes: on WordPress.com a revert can hit the same `tags_drift` collision as apply (see Revert), so a revert on a site with renamed or case-variant tags may need a few posts fixed by hand; on WP-CLI there is no automated tag revert yet (see the Step 2 limitation).
 
 ## Step 7 — Apply
 
@@ -262,6 +264,24 @@ Same spot-check discipline as `agents/apply.md`'s Post-Apply Verification: re-fe
 
 ## Revert
 
-There is no automated tag revert yet (see the Step 2 limitation). If the user asks to undo a tag-apply run:
-1. Point them at the pre-apply backup file's `tags`/`post_tags` keys and the `tag-changes-{timestamp}.tsv`/`tag-terms-{timestamp}.tsv` logs (WP-CLI runs write only `tag-changes-{timestamp}.tsv`). The backup's `tags` list has the deleted tags themselves, but `post_tags` only holds their assignments on published posts (see Step 2).
-2. Offer to manually reconstruct and apply the inverse operations yourself, reading the logs the same way `agents/restore.md`'s inverse-replay does for categories, but do this as a one-off manual process — do not claim this is the same reliability guarantee the category `restore()` path provides.
+**WordPress.com.** Tag runs are reverted by `agents/restore.md`, through the same `WpcomAdapter.restore()` call as category runs. Pass the tag logs as `tag_changes_log_path` / `tag_terms_log_path` and the Step 2 backup as `backup_path`:
+
+```python
+result = adapter.restore(
+    backup_path=f'data/backups/pre-tag-analysis-{ts}.json',
+    tag_changes_log_path=f'data/logs/tag-changes-{ts}.tsv',
+    tag_terms_log_path=f'data/logs/tag-terms-{ts}.tsv',
+    mode='auto',
+    dry_run=True,
+)
+```
+
+With both tag logs present this is an inverse replay: posts get their logged tags back, created tags are deleted, deleted tags are recreated under their original slug, and description/name updates are reverted. Categories are not touched, because no category log was passed. With only one tag log it falls back to a snapshot restore of tags from the backup, and says so in `errors`. Assignments a deleted tag had on posts outside the backup (see Step 2) are not restored.
+
+To snapshot-restore tags without logs, pass `mode='snapshot', taxonomies=['post_tag']`. Without `taxonomies`, a log-less snapshot restore stays category-only. A snapshot restore only rewrites posts whose tags differ from the backup, and deletes tags that aren't in the backup. A backup taken before tag support has no `tags` key, and the restore reports that as an error rather than treating it as "no tags".
+
+A revert writes post tags with `set_post_tags()`, so it can raise `tags_drift` the same way apply can (see Step 7). Those posts show up in `result['errors']` and the restore raises `PartialRestoreError`. Give the user the post IDs and the tags they should have, from the backup's `post_tags`, so they can fix them in wp-admin.
+
+**WP-CLI.** There is no automated tag revert on `wp-cli-*` yet (see the Step 2 limitation). If the user asks to undo a WP-CLI tag-apply run:
+1. Point them at the pre-apply backup file's `tags`/`post_tags` keys and the `tag-changes-{timestamp}.tsv` log (WP-CLI runs don't write a `tag-terms` log). The backup's `tags` list has the deleted tags themselves, but `post_tags` only holds their assignments on published posts (see Step 2).
+2. Offer to manually reconstruct and apply the inverse operations yourself, reading the log the same way `agents/restore.md`'s inverse-replay does for categories, but do this as a one-off manual process — do not claim this is the same reliability guarantee the `restore()` path provides.
