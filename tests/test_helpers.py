@@ -23,6 +23,7 @@ from helpers import (
     aggregate_tag_results,
     batch_manifest_path,
     calculate_batch_size,
+    check_largest_batch,
     compute_batch_fingerprint,
     find_incomplete_batches,
     find_similar_tags,
@@ -191,7 +192,32 @@ class TestCalculateBatchSize(unittest.TestCase):
     def test_minimum_batch_size(self):
         posts = [{'id': i, 'content': 'x' * 100000} for i in range(5)]
         size = calculate_batch_size(posts)
-        self.assertGreaterEqual(size, 5)
+        self.assertEqual(size, 1)
+
+    def test_long_posts_go_below_five(self):
+        """Regression for #47: a 5-post floor kept batches of long posts over
+        max_chars no matter how far TAXONOMIST_MAX_BATCH_TOKENS was lowered,
+        so the documented halve-and-retry recovery never converged."""
+        posts = [{'id': i, 'content': 'x' * 8000} for i in range(115)]
+        size = calculate_batch_size(posts, max_chars=20000)
+        self.assertLess(size, 5)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            write_batches(posts, tmpdir, batch_size=size)
+            ok, _, _ = check_largest_batch(tmpdir, max_chars=20000)
+            self.assertTrue(ok)
+
+    def test_halving_max_chars_shrinks_batches(self):
+        """Each halving step of the recovery procedure must make progress
+        until a batch is a single post."""
+        posts = [{'id': i, 'content': 'x' * 8000} for i in range(20)]
+        max_chars = 64000
+        sizes = [calculate_batch_size(posts, max_chars=max_chars)]
+        while sizes[-1] > 1 and len(sizes) < 10:
+            max_chars //= 2
+            sizes.append(calculate_batch_size(posts, max_chars=max_chars))
+        self.assertEqual(sizes[-1], 1)
+        for prev, cur in zip(sizes, sizes[1:]):
+            self.assertLess(cur, prev)
 
     def test_maximum_batch_size(self):
         posts = [{'id': i} for i in range(500)]

@@ -97,7 +97,12 @@ def calculate_batch_size(posts, max_chars=MAX_BATCH_CHARS):
     Calculate the optimal batch size based on actual post content sizes.
 
     Samples the posts to estimate average size, then calculates how many
-    fit under the token limit. Returns at least 5 and at most 200.
+    fit under the token limit. Returns at least 1 and at most 200.
+
+    There is deliberately no higher floor: when posts are long, lowering
+    max_chars (via TAXONOMIST_MAX_BATCH_TOKENS) must keep shrinking batches
+    down to a single post, or the halve-and-retry recovery in
+    agents/export.md can never converge (issue #47).
 
     Args:
         posts: List of post dicts from the export JSON.
@@ -116,8 +121,8 @@ def calculate_batch_size(posts, max_chars=MAX_BATCH_CHARS):
     # Account for JSON array overhead (brackets, commas).
     batch_size = int(max_chars / (avg_size + 2))
 
-    # Clamp between 5 and 200.
-    return max(5, min(200, batch_size))
+    # Clamp between 1 and 200.
+    return max(1, min(200, batch_size))
 
 
 def split_into_batches(posts, batch_size=None):

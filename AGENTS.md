@@ -251,7 +251,7 @@ Present flagged categories to the user for spot-checking before finalizing the p
 
 Use `lib/helpers.py` for splitting batches, aggregating results, and encoding WordPress API parameters (to avoid the array stringification bug) — do not write inline Python scripts for these operations. Use `lib.helpers.wp_urlencode()` for safe parameter encoding.
 
-**Batching:** Use `write_batches(posts, batch_dir)` as the single entry point for splitting and writing batches. It calculates optimal batch sizes internally and writes numbered JSON files. Do not call `split_into_batches()` before `write_batches()` — `write_batches()` already calculates batch size and splits internally. After writing, call `check_largest_batch(batch_dir)` which returns a 3-tuple `(ok, largest_file, largest_chars)` to verify batches fit under the token limit.
+**Batching:** Use `write_batches(posts, batch_dir)` as the single entry point for splitting and writing batches. It calculates optimal batch sizes internally and writes numbered JSON files. Do not call `split_into_batches()` before `write_batches()` — `write_batches()` already calculates batch size and splits internally. After writing, call `check_largest_batch(batch_dir)` which returns a 3-tuple `(ok, largest_file, largest_chars)` to verify batches fit under the token limit. That check is a conservative static estimate: if it reports `ok=False`, try reading the largest file before re-splitting, and follow the halve-and-retry steps in `agents/export.md` only if that Read actually fails. Batch size can drop to a single post, so the retry loop converges for long-form content.
 
 **Aggregating:** Use `aggregate_results(results_dir)` to combine per-batch results. It returns a dict:
 
